@@ -1,116 +1,210 @@
-import { BaseConfig, BaseConfigOptions, PromptModule } from '@ionic/cli-framework';
-import { TTY_WIDTH, prettyPath, wordWrap } from '@ionic/cli-framework/utils/format';
+import { BaseConfig, BaseConfigOptions, ParsedArgs, PromptModule } from '@ionic/cli-framework';
+import { resolveValue } from '@ionic/cli-framework/utils/fn';
+import { prettyPath } from '@ionic/cli-framework/utils/format';
 import { ERROR_INVALID_PACKAGE_JSON, compileNodeModulesPaths, readPackageJsonFile, resolve } from '@ionic/cli-framework/utils/node';
-import { writeJsonFile } from '@ionic/utils-fs';
+import { readJsonFile, writeJsonFile } from '@ionic/utils-fs';
 import chalk from 'chalk';
 import * as Debug from 'debug';
 import * as lodash from 'lodash';
 import * as path from 'path';
 
-import { MULTI_PROJECT_TYPES, PROJECT_FILE, PROJECT_TYPES } from '../../constants';
-import { IAilmentRegistry, IClient, IConfig, IIntegration, ILogger, IProject, IProjectConfig, ISession, IShell, InfoItem, IntegrationName, IonicContext, IonicEnvironmentFlags, PackageJson, ProjectIntegration, ProjectPersonalizationDetails, ProjectType } from '../../definitions';
+import { PROJECT_FILE, PROJECT_TYPES } from '../../constants';
+import { IAilmentRegistry, IClient, IConfig, IIntegration, ILogger, IMultiProjectConfig, IProject, IProjectConfig, ISession, IShell, InfoItem, IntegrationName, IonicContext, IonicEnvironmentFlags, PackageJson, ProjectIntegration, ProjectPersonalizationDetails, ProjectType } from '../../definitions';
 import { isMultiProjectConfig, isProjectConfig } from '../../guards';
 import * as ζbuild from '../build';
-import { FatalException, IntegrationNotFoundException, RunnerNotFoundException } from '../errors';
+import { BaseException, FatalException, IntegrationNotFoundException, RunnerNotFoundException } from '../errors';
 import * as ζgenerate from '../generate';
 import { BaseIntegration } from '../integrations';
 import * as ζserve from '../serve';
 
 const debug = Debug('ionic:lib:project');
 
-export interface ProjectDetails {
-  name?: string;
-  type: ProjectType;
+export interface ProjectDetailsDeps {
+  readonly rootDirectory: string;
+  readonly config?: { [key: string]: any; };
+  readonly args?: ParsedArgs;
+  readonly e: ProjectDeps;
 }
 
-export async function determineProjectDetails(rootProjectDir: string, projectName: string | undefined, projectConfig: { [key: string]: any; } | undefined, deps: ProjectDeps): Promise<ProjectDetails | undefined> {
-  let name: string | undefined;
-  let type: ProjectType | undefined;
+export interface ProjectDetailsResultBase {
+  readonly type?: ProjectType;
+  readonly errors: ReadonlyArray<ProjectDetailsError>;
+}
 
-  if (projectName) {
-    name = projectName;
-    debug(`Project name from projectName: ${chalk.bold(name)}`);
+export interface ProjectDetailsSingleAppResult extends ProjectDetailsResultBase {
+  readonly context: 'app';
+  readonly config: Readonly<IProjectConfig>;
+}
+
+export interface ProjectDetailsMultiAppResult extends ProjectDetailsResultBase {
+  readonly context: 'multiapp';
+  readonly config: Readonly<IMultiProjectConfig>;
+  readonly name?: string;
+}
+
+export interface ProjectDetailsUnknownResult extends ProjectDetailsResultBase {
+  readonly context: 'unknown';
+  readonly config?: unknown;
+}
+
+export type ProjectDetailsResult = (ProjectDetailsSingleAppResult | ProjectDetailsMultiAppResult | ProjectDetailsUnknownResult) & { readonly configPath: string; };
+
+export type ProjectDetailsErrorCode = 'ERR_INVALID_PROJECT_FILE' | 'ERR_INVALID_PROJECT_TYPE' | 'ERR_MISSING_PROJECT_TYPE' | 'ERR_MULTI_MISSING_CONFIG' | 'ERR_MULTI_MISSING_NAME';
+
+export class ProjectDetailsError extends BaseException {
+  constructor(msg: string, readonly code: ProjectDetailsErrorCode, readonly error?: Error) {
+    super(msg);
+  }
+}
+
+export class ProjectDetails {
+  readonly rootDirectory: string;
+
+  protected readonly args?: ParsedArgs;
+  protected readonly e: ProjectDeps;
+  protected _result?: ProjectDetailsResult;
+  protected _errors?: ProjectDetailsError[];
+
+  constructor({ rootDirectory, args, e }: ProjectDetailsDeps) {
+    this.rootDirectory = rootDirectory;
+    this.args = args;
+    this.e = e;
   }
 
-  if (isProjectConfig(projectConfig)) {
-    type = projectConfig.type;
-  } else if (isMultiProjectConfig(projectConfig)) {
-    if (!name) {
-      const { ctx } = deps;
+  async result(): Promise<ProjectDetailsResult> {
+    if (!this._result) {
+      this._result = await this.determine();
+    }
 
-      for (const [ key, value ] of lodash.entries(projectConfig.projects)) {
-        if (value && value.root) {
-          const projectDir = path.resolve(rootProjectDir, value.root);
+    return this._result;
+  }
 
-          if (ctx.execPath.startsWith(projectDir)) {
-            name = key;
-            debug(`Project name from path match: ${chalk.bold(name)}`);
-            break;
-          }
+  protected async getNameFromArgs(): Promise<string | undefined> {
+    const name = this.args && this.args['project'] ? String(this.args['project']) : undefined;
+
+    if (name) {
+      debug(`Project name from args: ${chalk.bold(name)}`);
+      return name;
+    }
+  }
+
+  protected async getNameFromPathMatch(config: IMultiProjectConfig): Promise<string | undefined> {
+    const { ctx } = this.e;
+
+    for (const [ key, value ] of lodash.entries(config.projects)) {
+      const name = key;
+
+      if (value && value.root) {
+        const projectDir = path.resolve(this.rootDirectory, value.root);
+
+        if (ctx.execPath.startsWith(projectDir)) {
+          debug(`Project name from path match: ${chalk.bold(name)}`);
+          return name;
         }
       }
     }
+  }
 
-    if (!name && projectConfig.defaultProject) {
-      name = projectConfig.defaultProject;
+  protected async getNameFromDefaultProject(config: IMultiProjectConfig): Promise<string | undefined> {
+    const name = config.defaultProject;
+
+    if (name) {
       debug(`Project name from defaultProject: ${chalk.bold(name)}`);
-    }
-
-    if (!name) {
-      throw new Error(
-        `Multi-app workspace detected, but cannot determine which project to use.\n` +
-        `Please set a ${chalk.green('defaultProject')} in ${chalk.bold(PROJECT_FILE)} or specify the project using the global ${chalk.green('--project')} option.`
-      );
-    }
-
-    const config = projectConfig.projects[name];
-
-    if (config) {
-      type = config.type;
-      debug(`Project type from config: ${chalk.bold(prettyProjectName(type))} ${type ? chalk.bold(`(${type})`) : ''}`);
-    } else {
-      throw new Error(
-        `Multi-app workspace detected, but project was not found in configuration.\n` +
-        `Project ${chalk.green(name)} could not be found in the workspace. Did you add it to ${chalk.bold(PROJECT_FILE)}?`
-      );
-    }
-
-    if (type && !MULTI_PROJECT_TYPES.includes(type)) {
-      throw new Error(
-        `Multi-app workspace detected, but project is of an unsupported type.\n` +
-        `Project type ${chalk.green(type)} is not supported in multi-app workspaces. Please set ${chalk.green(`projects.${name}.type`)} to one of: ${MULTI_PROJECT_TYPES.map(v => chalk.green(v)).join(', ')}.`
-      );
+      return name;
     }
   }
 
-  if (!type) {
+  protected async getTypeFromConfig(config: IProjectConfig): Promise<ProjectType | undefined> {
+    const { type } = config;
+
+    if (type) {
+      debug(`Project type from config: ${chalk.bold(prettyProjectName(type))} ${type ? chalk.bold(`(${type})`) : ''}`);
+      return type;
+    }
+  }
+
+  protected async getTypeFromDetection(): Promise<ProjectType | undefined> {
     for (const projectType of PROJECT_TYPES) {
-      const p = await createProjectFromType(path.resolve(rootProjectDir, PROJECT_FILE), projectName, deps, projectType);
+      const p = await createProjectFromType(path.resolve(this.rootDirectory, PROJECT_FILE), undefined, this.e, projectType);
+      const type = p.type;
 
       if (await p.detected()) {
-        debug(`Project type from detection: ${chalk.bold(prettyProjectName(p.type))} ${p.type ? chalk.bold(`(${p.type})`) : ''}`);
-        type = p.type;
-        break;
+        debug(`Project type from detection: ${chalk.bold(prettyProjectName(type))} ${type ? chalk.bold(`(${type})`) : ''}`);
+        return type;
       }
     }
   }
 
-  if (type && PROJECT_TYPES.includes(type)) {
-    return { name, type };
+  protected async determineSingleApp(config: IProjectConfig): Promise<ProjectDetailsSingleAppResult> {
+    const errors: ProjectDetailsError[] = [];
+    const type = await resolveValue(
+      async () => this.getTypeFromConfig(config),
+      async () => this.getTypeFromDetection()
+    );
+
+    if (!type) {
+      errors.push(new ProjectDetailsError('Could not determine project type.', 'ERR_MISSING_PROJECT_TYPE'));
+    } else if (!PROJECT_TYPES.includes(type)) {
+      errors.push(new ProjectDetailsError('Invalid project type.', 'ERR_INVALID_PROJECT_TYPE'));
+    }
+
+    return { context: 'app', config, type, errors };
   }
 
-  const listWrapOptions = { width: TTY_WIDTH - 8 - 3, indentation: 1 };
+  protected async determineMultiApp(config: IMultiProjectConfig): Promise<ProjectDetailsMultiAppResult> {
+    const errors: ProjectDetailsError[] = [];
+    const name = await resolveValue(
+      async () => this.getNameFromArgs(),
+      async () => this.getNameFromPathMatch(config),
+      async () => this.getNameFromDefaultProject(config)
+    );
 
-  // TODO: move some of this to the CLI docs
+    let type: ProjectType | undefined;
 
-  throw new Error(
-    `Could not determine project type (project config: ${chalk.bold(prettyPath(path.resolve(rootProjectDir, PROJECT_FILE)))}).\n` +
-    `- ${wordWrap(`For ${chalk.bold(prettyProjectName('angular'))} projects, make sure ${chalk.green('@ionic/angular')} is listed as a dependency in ${chalk.bold('package.json')}.`, listWrapOptions)}\n` +
-    `- ${wordWrap(`For ${chalk.bold(prettyProjectName('ionic-angular'))} projects, make sure ${chalk.green('ionic-angular')} is listed as a dependency in ${chalk.bold('package.json')}.`, listWrapOptions)}\n` +
-    `- ${wordWrap(`For ${chalk.bold(prettyProjectName('ionic1'))} projects, make sure ${chalk.green('ionic')} is listed as a dependency in ${chalk.bold('bower.json')}.`, listWrapOptions)}\n\n` +
-    `Alternatively, set ${chalk.bold('type')} attribute in ${chalk.bold(PROJECT_FILE)} to one of: ${PROJECT_TYPES.map(v => chalk.green(v)).join(', ')}.\n\n` +
-    `If the Ionic CLI does not know what type of project this is, ${chalk.green('ionic build')}, ${chalk.green('ionic serve')}, and other commands may not work. You can use the ${chalk.green('custom')} project type if that's okay.`
-  );
+    if (name) {
+      const app = config.projects[name];
+
+      if (app) {
+        const result = await this.determineSingleApp(app);
+        type = result.type;
+        errors.push(...result.errors);
+      } else {
+        errors.push(new ProjectDetailsError('Could not find project in config.', 'ERR_MULTI_MISSING_CONFIG'));
+      }
+    } else {
+      errors.push(new ProjectDetailsError('Could not determine project name.', 'ERR_MULTI_MISSING_NAME'));
+    }
+
+    return { context: 'multiapp', config, name, type, errors };
+  }
+
+  protected async determine(): Promise<ProjectDetailsResult> {
+    const errors: ProjectDetailsError[] = [];
+    const configPath = path.resolve(this.rootDirectory, PROJECT_FILE);
+    let config: { [key: string]: any; } | undefined;
+
+    try {
+      config = await readJsonFile(configPath);
+    } catch (e) {
+      errors.push(new ProjectDetailsError('Could not read project file.', 'ERR_INVALID_PROJECT_FILE', e));
+    }
+
+    if (config) {
+      if (isProjectConfig(config)) {
+        const result = await this.determineSingleApp(config);
+        errors.push(...result.errors);
+        return { configPath, errors, ...result };
+      }
+
+      if (isMultiProjectConfig(config)) {
+        const result = await this.determineMultiApp(config);
+        errors.push(...result.errors);
+        return { configPath, errors, ...result };
+      }
+    }
+
+    return { configPath, context: 'unknown', config, errors };
+  }
 }
 
 export async function createProjectFromType(filePath: string, name: string | undefined, deps: ProjectDeps, type: ProjectType): Promise<IProject> {
@@ -410,9 +504,9 @@ export function prettyProjectName(type?: string): string {
   }
 
   if (type === 'angular') {
-    return 'ionic/angular 4';
+    return '@ionic/angular';
   } else if (type === 'ionic-angular') {
-    return 'Ionic Angular 3';
+    return 'Ionic 2/3';
   } else if (type === 'ionic1') {
     return 'Ionic 1';
   }

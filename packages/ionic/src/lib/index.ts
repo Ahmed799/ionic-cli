@@ -1,19 +1,19 @@
-import { LOGGER_LEVELS, createPromptModule } from '@ionic/cli-framework';
-import { prettyPath } from '@ionic/cli-framework/utils/format';
+import { LOGGER_LEVELS, ParsedArgs, createPromptModule } from '@ionic/cli-framework';
+import { TTY_WIDTH, prettyPath, wordWrap } from '@ionic/cli-framework/utils/format';
 import { TERMINAL_INFO } from '@ionic/cli-framework/utils/terminal';
-import { findBaseDirectory, readJsonFile } from '@ionic/utils-fs';
+import { findBaseDirectory } from '@ionic/utils-fs';
 import chalk from 'chalk';
 import * as Debug from 'debug';
 import * as path from 'path';
 
 import { ERROR_VERSION_TOO_OLD } from '../bootstrap';
-import { PROJECT_FILE } from '../constants';
+import { PROJECT_FILE, PROJECT_TYPES } from '../constants';
 import { IProject, InfoItem, IonicContext, IonicEnvironment, IonicEnvironmentFlags } from '../definitions';
 
 import { CONFIG_FILE, Config, DEFAULT_CONFIG_DIRECTORY, parseGlobalOptions } from './config';
 import { Environment } from './environment';
 import { Client } from './http';
-import { ProjectDeps, ProjectDetails, createProjectFromType, determineProjectDetails } from './project';
+import { ProjectDeps, ProjectDetails, createProjectFromType, prettyProjectName } from './project';
 import { createOnFallback } from './prompts';
 import { ProSession } from './session';
 import { Shell, prependNodeModulesBinToPath } from './shell';
@@ -22,50 +22,89 @@ import { Logger, createDefaultLoggerHandlers } from './utils/logger';
 
 const debug = Debug('ionic:lib');
 
-export async function getProject(projectDir: string | undefined, projectName: string | undefined, deps: ProjectDeps): Promise<IProject | undefined> {
-  if (!projectDir) {
+export async function getProject(rootDirectory: string | undefined, args: ParsedArgs, deps: ProjectDeps): Promise<IProject | undefined> {
+  if (!rootDirectory) {
     return;
   }
 
   const { log } = deps;
-  const projectFilePath = path.resolve(projectDir, PROJECT_FILE);
-  let projectFile: { [key: string]: any; } | undefined;
-  let projectDetails: ProjectDetails | undefined;
+  const details = new ProjectDetails({ rootDirectory, args, e: deps });
+  const { errors, ...result } = await details.result();
+  const errorCodes = errors.map(e => e.code);
+  debug('Project details: %o', { ...result, errorCodes });
+  const { type } = result;
 
-  try {
-    projectFile = await readJsonFile(projectFilePath);
-  } catch (e) {
+  const err = errors.find(e => e.code === 'ERR_INVALID_PROJECT_FILE');
+
+  if (err) {
     log.error(
       `Error while loading project config file.\n` +
-      `Attempted to load project config ${chalk.bold(prettyPath(projectFilePath))} but got error:\n\n` +
-      chalk.red(e.toString())
+      `Attempted to load project config ${chalk.bold(prettyPath(result.configPath))} but got error:\n\n` +
+      chalk.red(err.error ? err.error.toString() : 'ERR_INVALID_PROJECT_FILE')
     );
+
     log.nl();
   }
 
-  if (projectFile) {
-    try {
-      projectDetails = await determineProjectDetails(projectDir, projectName, projectFile, deps);
-    } catch (e) {
-      log.warn(e.toString());
+  if (result.context === 'multiapp') {
+    if (errorCodes.includes('ERR_MULTI_MISSING_NAME')) {
+      log.warn(
+        `Multi-app workspace detected, but cannot determine which project to use.\n` +
+        `Please set a ${chalk.green('defaultProject')} in ${chalk.bold(prettyPath(result.configPath))} or specify the project using the global ${chalk.green('--project')} option. Read the documentation${chalk.cyan('[1]')} for more information.\n\n` +
+        `${chalk.cyan('[1]')}: ${chalk.bold('https://beta.ionicframework.com/docs/cli/configuration#multi-app-projects')}`
+      );
+
       log.nl();
+    }
+
+    if (result.name && errorCodes.includes('ERR_MULTI_MISSING_CONFIG')) {
+      log.warn(
+        `Multi-app workspace detected, but project was not found in configuration.\n` +
+        `Project ${chalk.green(result.name)} could not be found in the workspace. Did you add it to ${chalk.bold(prettyPath(result.configPath))}?`
+      );
     }
   }
 
-  if (!projectDetails) {
+  if (errorCodes.includes('ERR_MISSING_PROJECT_TYPE')) {
+    const listWrapOptions = { width: TTY_WIDTH - 8 - 3, indentation: 1 };
+
+    log.warn(
+      `Could not determine project type (project config: ${chalk.bold(prettyPath(result.configPath))}).\n` +
+      `- ${wordWrap(`For ${chalk.bold(prettyProjectName('angular'))} projects, make sure ${chalk.green('@ionic/angular')} is listed as a dependency in ${chalk.bold('package.json')}.`, listWrapOptions)}\n` +
+      `- ${wordWrap(`For ${chalk.bold(prettyProjectName('ionic-angular'))} projects, make sure ${chalk.green('ionic-angular')} is listed as a dependency in ${chalk.bold('package.json')}.`, listWrapOptions)}\n` +
+      `- ${wordWrap(`For ${chalk.bold(prettyProjectName('ionic1'))} projects, make sure ${chalk.green('ionic')} is listed as a dependency in ${chalk.bold('bower.json')}.`, listWrapOptions)}\n\n` +
+      `Alternatively, set ${chalk.bold('type')} attribute in ${chalk.bold(prettyPath(result.configPath))} to one of: ${PROJECT_TYPES.map(v => chalk.green(v)).join(', ')}.\n\n` +
+      `If the Ionic CLI does not know what type of project this is, ${chalk.green('ionic build')}, ${chalk.green('ionic serve')}, and other commands may not work. You can use the ${chalk.green('custom')} project type if that's okay.`
+    );
+
+    log.nl();
+  }
+
+  if (!type) {
     return;
   }
 
-  const { name, type } = projectDetails;
+  if (errorCodes.includes('ERR_INVALID_PROJECT_TYPE')) {
+    log.error(
+      `Invalid project type: ${chalk.green(type)} (project config: ${chalk.bold(prettyPath(result.configPath))}).\n` +
+      `Project type must be one of: ${PROJECT_TYPES.map(v => chalk.green(v)).join(', ')}`
+    );
 
-  return createProjectFromType(projectFilePath, name, deps, type);
+    log.nl();
+    return;
+  }
+
+  if (result.context === 'app') {
+    return createProjectFromType(result.configPath, undefined, deps, type);
+  } else if (result.context === 'multiapp') {
+    return createProjectFromType(result.configPath, result.name, deps, type);
+  }
 }
 
 export async function generateIonicEnvironment(ctx: IonicContext, pargv: string[]): Promise<{ env: IonicEnvironment; project?: IProject; }> {
   process.chdir(ctx.execPath);
 
   const argv = parseGlobalOptions(pargv);
-  const projectName = argv['project'] ? String(argv['project']) : undefined;
   const config = new Config(path.resolve(process.env['IONIC_CONFIG_DIRECTORY'] || DEFAULT_CONFIG_DIRECTORY, CONFIG_FILE));
 
   debug('Terminal info: %o', TERMINAL_INFO);
@@ -134,7 +173,7 @@ export async function generateIonicEnvironment(ctx: IonicContext, pargv: string[
     log.warn(`${chalk.green('--yarn')} / ${chalk.green('--no-yarn')} has been removed. Use ${chalk.green(`ionic config set -g npmClient ${argv['yarn'] ? 'yarn' : 'npm'}`)}.`);
   }
 
-  const project = await getProject(projectDir, projectName, deps);
+  const project = await getProject(projectDir, argv, deps);
 
   if (project) {
     shell.alterPath = p => prependNodeModulesBinToPath(project.directory, p);

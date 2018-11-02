@@ -440,7 +440,7 @@ ${chalk.cyan('[1]')}: ${chalk.bold('https://ionicframework.com/docs/cli/starters
       project.config.set('type', this.schema.type);
       project.config.set('root', path.relative(this.project.rootDirectory, projectDir));
     } else {
-      project = await getProject(projectDir, undefined, this.env);
+      project = await getProject(projectDir, { _: [] }, this.env);
     }
 
     // start is weird, once the project directory is created, it becomes a
